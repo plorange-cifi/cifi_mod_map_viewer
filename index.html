@@ -95,10 +95,9 @@
     margin: 0 auto;
     line-height: 0;
   }
-  #mapImage { display: block; width: 100%; height: auto; }
+  #mapImage { display: block; width: 100%; height: auto; cursor: pointer; }
   #overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
-  .future-box { stroke-width: 2; vector-effect: non-scaling-stroke; cursor: pointer; }
-  .future-box:hover { opacity: 0.8; }
+  .future-box { stroke-width: 2; vector-effect: non-scaling-stroke; }
   .map-label {
     fill: #fff7ce;
     stroke: #160d0b;
@@ -107,11 +106,38 @@
     font: 700 13px Consolas, monospace;
     text-anchor: middle;
     dominant-baseline: auto;
-    pointer-events: none;
   }
   .map-label.future { fill: #fff; font-size: 12px; }
+  .map-label.over-limit { fill: #ff4d4f; }
+  .map-label.mp-limit-indicator { fill: #ff4d4f; font-size: 10px; }
+  .mod-badge { cursor: pointer; }
+  .mod-badge:hover rect { opacity: 0.85; }
+  .locked-icon {
+    fill: #ff6b6b;
+    font-weight: bold;
+    font-size: 10px;
+  }
+  .tooltip {
+    display: none;
+    position: fixed;
+    background: rgba(33, 20, 20, 0.95);
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 8px 10px;
+    font-size: 12px;
+    color: var(--text);
+    max-width: min(320px, calc(100vw - 16px));
+    z-index: 1000;
+    pointer-events: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+  .tooltip.visible { display: block; }
+  .tooltip-title { font-weight: bold; color: var(--accent); }
+  .tooltip-line { margin-top: 4px; }
+  .tooltip-locked { color: #ff6b6b; }
   @media (max-width: 760px) {
-    header { gap: 10px 14px; padding: 10px 12px; }
+    header { gap: 10px 14px; padding: 10px 12px; flex-wrap: wrap; }
     h1 { width: 100%; font-size: 18px; }
     #status { margin-left: 0; width: 100%; }
     main { padding: 7px; }
@@ -124,7 +150,8 @@
   <h1>Loop Mod Map</h1>
   <label class="control">Current MP <input id="currentMp" type="text" value="0" aria-label="Current MP"></label>
   <label class="control">Max future MP <input id="futureMp" type="text" value="0" aria-label="Maximum future MP"></label>
-  <button id="shareButton" type="button" title="Copy share link">🔗 Share</button>
+  <label class="control"><input id="limitMaxMp" type="checkbox"> Limit to max MP</label>
+  <button id="updateButton" type="button">Update</button>
   <button id="resetButton" type="button">Reset</button>
   <span id="status" role="status">Loading map data...</span>
 </header>
@@ -136,6 +163,7 @@
     </div>
   </div>
 </main>
+<div id="tooltip" class="tooltip"></div>
 <script>
 (() => {
   const palette = {
@@ -148,11 +176,114 @@
   const status = document.getElementById('status');
   const image = document.getElementById('mapImage');
   const overlay = document.getElementById('overlay');
-  const currentMp = document.getElementById('currentMp');
-  const futureMp = document.getElementById('futureMp');
+  const currentMpInput = document.getElementById('currentMp');
+  const futureMpInput = document.getElementById('futureMp');
+  const limitMaxMpCheckbox = document.getElementById('limitMaxMp');
+  const tooltip = document.getElementById('tooltip');
   let mods = [];
   let badges = [];
-  let modLevelOverrides = {}; // Track user-made level changes
+  let userLevels = new Map(); // Code -> userSetLevel
+  let autoLevels = new Map(); // Code -> autoCalculatedLevel
+  let tooltipTimeout = null;
+
+  // URL state management
+  function levelCodebook() {
+    return [...new Set(mods.map(mod => mod.Code))].sort();
+  }
+
+  function userLevelBlocks() {
+    const codes = levelCodebook();
+    const modsByCode = new Map(mods.map(mod => [mod.Code, mod]));
+    const groups = new Map();
+    for (const code of codes) {
+      const letter = code[0];
+      if (!groups.has(letter)) groups.set(letter, []);
+      groups.get(letter).push(code);
+    }
+
+    const blocks = [];
+    for (const [letter, groupCodes] of groups) {
+      const slots = [];
+      let hasUserLevel = false;
+      for (const code of groupCodes) {
+        const level = userLevels.get(code) || 0;
+        const maxLevel = modsByCode.get(code).levels.length;
+        const width = maxLevel > 35 ? 2 : 1;
+        if (!Number.isInteger(level) || level < 0 || level > maxLevel || level >= 36 ** width) return null;
+        if (level > 0) hasUserLevel = true;
+        slots.push({ level, encoded: level.toString(36).toUpperCase().padStart(width, '0') });
+      }
+      if (hasUserLevel) {
+        while (slots.length && slots[slots.length - 1].level === 0) slots.pop();
+        blocks.push(letter + slots.map(slot => slot.encoded).join(''));
+      }
+    }
+    return blocks.join('-');
+  }
+
+  function decodeUserLevelBlocks(encoded) {
+    if (!encoded) return {};
+    const codes = levelCodebook();
+    const modsByCode = new Map(mods.map(mod => [mod.Code, mod]));
+    const groups = new Map();
+    for (const code of codes) {
+      const letter = code[0];
+      if (!groups.has(letter)) groups.set(letter, []);
+      groups.get(letter).push(code);
+    }
+
+    const userLevels = {};
+    const seen = new Set();
+    for (const block of encoded.split('-')) {
+      if (!block) return {};
+      const letter = block[0];
+      const groupCodes = groups.get(letter);
+      if (!groupCodes || seen.has(letter)) return {};
+      seen.add(letter);
+      let offset = 1;
+
+      for (const code of groupCodes) {
+        const width = modsByCode.get(code).levels.length > 35 ? 2 : 1;
+        if (offset === block.length) break;
+        const valueText = block.slice(offset, offset + width);
+        if (valueText.length !== width || !/^[0-9A-Z]+$/.test(valueText)) return {};
+        const level = Number.parseInt(valueText, 36);
+        if (!Number.isInteger(level) || level > modsByCode.get(code).levels.length) return {};
+        if (level > 0) userLevels[code] = level;
+        offset += width;
+      }
+      if (offset !== block.length) return {};
+    }
+    return userLevels;
+  }
+
+  function getUrlParams() {
+    const params = new URLSearchParams(window.location.search);
+    return {
+      currentMp: params.get('currentMp') || '0',
+      futureMp: params.get('futureMp') || '0',
+      limitMaxMp: params.get('limitMaxMp') === '1',
+      userLevels: decodeUserLevelBlocks(params.get('u') || '')
+    };
+  }
+
+  function restoreUrlState() {
+    const params = getUrlParams();
+    currentMpInput.value = params.currentMp;
+    futureMpInput.value = params.futureMp;
+    limitMaxMpCheckbox.checked = params.limitMaxMp;
+    userLevels = new Map(Object.entries(params.userLevels));
+  }
+
+  function setUrlParams() {
+    const params = new URLSearchParams();
+    if (currentMpInput.value && currentMpInput.value !== '0') params.set('currentMp', currentMpInput.value);
+    if (futureMpInput.value && futureMpInput.value !== '0') params.set('futureMp', futureMpInput.value);
+    if (limitMaxMpCheckbox.checked) params.set('limitMaxMp', '1');
+    if (userLevels.size) params.set('u', userLevelBlocks() || '');
+    const newUrl = params.toString() ? `?${params}` : window.location.pathname;
+    window.history.replaceState({}, '', newUrl);
+  }
 
   function parseCsv(text) {
     const rows = [];
@@ -210,13 +341,14 @@
     return { mantissa: mantissa / (10 ** shift), exponent: exponent + shift };
   }
 
-  function affordableLevelCount(mod, budget) {
+  function affordableLevelCount(mod, budget, strictlyBelow = false) {
     if (!budget) return 0;
     let spent = { mantissa: 0, exponent: 0 }, count = 0;
     for (const level of mod.levels) {
       if (!level.cost) continue;
       const nextSpent = spent.mantissa === 0 ? level.cost : add(spent, level.cost);
-      if (compare(nextSpent, budget) > 0) break;
+      const comparison = compare(nextSpent, budget);
+      if (comparison > 0 || (strictlyBelow && comparison === 0)) break;
       spent = nextSpent;
       count++;
     }
@@ -225,88 +357,287 @@
 
   function colorFor(type) { return palette[type] || palette.Unknown; }
 
-  function getCurrentLevel(mod) {
-    return modLevelOverrides[mod.Code] !== undefined ? modLevelOverrides[mod.Code] : 0;
+  function prerequisiteCodes(mod) {
+    return (mod.unlockedBy || '').split(',').map(code => code.trim())
+      .filter(code => code && mods.some(candidate => candidate.Code === code));
+  }
+
+  function canUnlock(modCode, checking = new Set()) {
+    if (checking.has(modCode)) return false;
+    const mod = mods.find(m => m.Code === modCode);
+    if (!mod) return true;
+    const unlockerCodes = prerequisiteCodes(mod);
+    if (!unlockerCodes.length) return true;
+    const nextChecking = new Set(checking);
+    nextChecking.add(modCode);
+    return unlockerCodes.every(unlockerCode => {
+      const unlockerLevel = getDisplayLevel(unlockerCode);
+      return unlockerLevel >= 1 && canUnlock(unlockerCode, nextChecking);
+    });
+  }
+
+  function calculateAutoLevel(modCode, budget) {
+    const mod = mods.find(m => m.Code === modCode);
+    if (!mod) return 0;
+    return affordableLevelCount(mod, budget);
+  }
+
+  function calculateFutureLevel(modCode, budget, cache, calculating = new Set()) {
+    if (cache.has(modCode)) return cache.get(modCode);
+    if (calculating.has(modCode)) return 0;
+
+    const mod = mods.find(m => m.Code === modCode);
+    if (!mod) return 0;
+
+    if (!canUnlock(modCode)) {
+      calculating.add(modCode);
+      const canMeetPrerequisites = prerequisiteCodes(mod).every(unlockerCode =>
+        calculateFutureLevel(unlockerCode, budget, cache, calculating) >= 1
+      );
+      calculating.delete(modCode);
+      if (!canMeetPrerequisites) {
+        cache.set(modCode, 0);
+        return 0;
+      }
+    }
+
+    const futureLevel = affordableLevelCount(mod, budget);
+    cache.set(modCode, futureLevel);
+    return futureLevel;
+  }
+
+  function maxLevelForMod(mod) {
+    if (!limitMaxMpCheckbox.checked) return mod.levels.length;
+    const budget = parseMagnitude(futureMpInput.value);
+    return budget ? affordableLevelCount(mod, budget, true) : 0;
+  }
+
+  function getDisplayLevel(modCode) {
+    const level = userLevels.has(modCode) ? userLevels.get(modCode) : autoLevels.get(modCode) || 0;
+    const mod = mods.find(candidate => candidate.Code === modCode);
+    if (!mod || !limitMaxMpCheckbox.checked || userLevels.has(modCode)) return level;
+    return Math.min(level, maxLevelForMod(mod));
+  }
+
+  function updateAutoLevels() {
+    const now = parseMagnitude(currentMpInput.value);
+    autoLevels.clear();
+    for (const mod of mods) {
+      autoLevels.set(mod.Code, calculateAutoLevel(mod.Code, now));
+    }
+  }
+
+  function changeModLevel(modCode, delta) {
+    const mod = mods.find(m => m.Code === modCode);
+    if (!mod) return;
+
+    const currentLevel = getDisplayLevel(modCode);
+    const maxLevel = mod.levels.length;
+    if (delta > 0 && limitMaxMpCheckbox.checked && currentLevel >= maxLevelForMod(mod)) return;
+
+    let newLevel = currentLevel + delta;
+    newLevel = Math.max(0, Math.min(newLevel, maxLevel));
+
+    if (newLevel === 0) {
+      userLevels.delete(modCode);
+    } else {
+      // Check unlock requirement
+      if (!canUnlock(modCode)) return;
+      userLevels.set(modCode, newLevel);
+    }
+
+    setUrlParams();
+    render();
+  }
+
+  function hideTooltip() {
+    tooltip.classList.remove('visible');
+  }
+
+  function showTooltip(badge, group) {
+    const modByCode = new Map(mods.map(mod => [mod.Code, mod]));
+    const mod = modByCode.get(badge.label);
+    if (!mod) return;
+
+    const currentLevel = getDisplayLevel(badge.label);
+    const maxLevel = mod.levels.length;
+    const isLocked = !canUnlock(badge.label);
+    const exceedsMaxMp = limitMaxMpCheckbox.checked && currentLevel > maxLevelForMod(mod);
+
+    let html = `<div class="tooltip-title">${mod.mod_name} (${mod.Code})</div>`;
+    html += `<div class="tooltip-line">Type: ${mod.mod_type}</div>`;
+    if (exceedsMaxMp) html += '<div class="tooltip-line tooltip-locked">Current level exceeds max MP</div>';
+
+    if (isLocked) {
+      const unlockerMod = mods.find(m => m.Code === mod.unlockedBy);
+      html += `<div class="tooltip-line tooltip-locked">🔒 Locked - requires ${unlockerMod?.mod_name} level 1</div>`;
+      if (mod.levels[0]?.cost) {
+        html += `<div class="tooltip-line">Cost to unlock: ${formatMagnitude(mod.levels[0].cost)}</div>`;
+      }
+    } else {
+      html += `<div class="tooltip-line">Level: ${currentLevel >= maxLevel ? 'MAX' : currentLevel}/${maxLevel}</div>`;
+      if (currentLevel < maxLevel && mod.levels[currentLevel]?.cost) {
+        html += `<div class="tooltip-line">Cost to next: ${formatMagnitude(mod.levels[currentLevel].cost)}</div>`;
+      }
+    }
+    tooltip.innerHTML = html;
+    tooltip.classList.add('visible');
+    const bounds = group.getBoundingClientRect();
+    const left = Math.min(bounds.right, window.innerWidth - tooltip.offsetWidth - 8);
+    const top = Math.min(bounds.top, window.innerHeight - tooltip.offsetHeight - 8);
+    tooltip.style.left = Math.max(8, left) + 'px';
+    tooltip.style.top = Math.max(8, top) + 'px';
+  }
+
+  function formatMagnitude(mag) {
+    if (!mag) return '—';
+    const exponent = mag.exponent;
+    if (exponent < 3) return String(mag.mantissa * (10 ** exponent));
+    const suffixes = ['', 'k', 'm', 'b', 't', 'qa', 'qu', 'sx', 'sp', 'o', 'n', 'd'];
+    const suffixIndex = Math.floor(exponent / 3);
+    const suffix = suffixes[suffixIndex] || `e${exponent}`;
+    const adjustedExp = exponent % 3;
+    const value = mag.mantissa * (10 ** adjustedExp);
+    return value.toFixed(2).replace(/\.?0+$/, '') + suffix;
   }
 
   function render() {
     if (!mods.length || !badges.length || !image.naturalWidth) return;
-    const now = parseMagnitude(currentMp.value);
-    const later = parseMagnitude(futureMp.value);
+    updateAutoLevels();
+    const now = parseMagnitude(currentMpInput.value);
+    const later = parseMagnitude(futureMpInput.value);
     const modByCode = new Map(mods.map(mod => [mod.Code, mod]));
+    const futureLevels = new Map();
     overlay.setAttribute('viewBox', `0 0 ${image.naturalWidth} ${image.naturalHeight}`);
     overlay.replaceChildren();
     let matched = 0;
+
     for (const badge of badges) {
       const mod = modByCode.get(badge.label);
       if (mod) matched++;
       const x = Number(badge.x), y = Number(badge.y);
       const width = Number(badge.width), height = Number(badge.height);
       if (![x, y, width, height].every(Number.isFinite)) continue;
-      const currentLevel = mod ? affordableLevelCount(mod, now) : 0;
-      const futureLevel = mod ? affordableLevelCount(mod, later) : 0;
-      const userLevel = mod ? getCurrentLevel(mod) : 0;
+
+      const isLocked = !mod || !canUnlock(badge.label);
+      const currentLevel = isLocked ? 0 : getDisplayLevel(badge.label);
+      const maxLevel = mod ? mod.levels.length : 0;
+      const maxMpLevel = mod && limitMaxMpCheckbox.checked ? maxLevelForMod(mod) : maxLevel;
+      const userLevelOverLimit = !isLocked && limitMaxMpCheckbox.checked && userLevels.has(badge.label)
+        && userLevels.get(badge.label) > maxMpLevel;
+      const limitedByMaxMp = !isLocked && limitMaxMpCheckbox.checked
+        && maxMpLevel < maxLevel && currentLevel >= maxMpLevel;
+
+      let futureLevel = 0;
+      if (mod && later) {
+        futureLevel = calculateFutureLevel(mod.Code, later, futureLevels);
+      }
+
       const extra = Math.max(0, futureLevel - currentLevel);
       const color = mod ? colorFor(mod.mod_type) : palette.Unknown;
-      
-      // Show highlight if user level exists and is less than current+future affordable
-      const shouldHighlight = userLevel > 0 && userLevel <= futureLevel;
-      
-      if (shouldHighlight || extra > 0) {
+
+      // Create clickable group
+      const group = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+      group.setAttribute('class', 'mod-badge');
+      group.style.cursor = 'pointer';
+
+      // Background rect for click area
+      const bgRect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+      bgRect.setAttribute('x', x); bgRect.setAttribute('y', y);
+      bgRect.setAttribute('width', width); bgRect.setAttribute('height', height);
+      bgRect.setAttribute('rx', 3);
+      bgRect.setAttribute('fill', 'transparent');
+      bgRect.setAttribute('stroke', 'none');
+      group.append(bgRect);
+
+      // Future highlight box
+      if (extra > 0 && later) {
         const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
         rect.setAttribute('x', x); rect.setAttribute('y', y);
         rect.setAttribute('width', width); rect.setAttribute('height', height);
         rect.setAttribute('rx', 3);
-        rect.setAttribute('fill', color); rect.setAttribute('fill-opacity', shouldHighlight ? '0.5' : '0.35');
+        rect.setAttribute('fill', color); rect.setAttribute('fill-opacity', '0.35');
         rect.setAttribute('stroke', color); rect.setAttribute('class', 'future-box');
-        rect.setAttribute('data-code', badge.label);
-        
         const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = mod ? `${mod.mod_name} (${mod.mod_type}): Level ${userLevel || 0}` : badge.label;
-        rect.append(title); 
-        
-        rect.addEventListener('click', (e) => {
-          e.preventDefault();
-          incrementMod(badge.label);
-        });
-        rect.addEventListener('contextmenu', (e) => {
-          e.preventDefault();
-          decrementMod(badge.label);
-        });
-        
-        overlay.append(rect);
+        title.textContent = `${mod.mod_name} (${mod.mod_type}): ${currentLevel} now, +${extra} by max future MP`;
+        rect.append(title);
+        group.append(rect);
       }
-      
+
+      // Main level label
       const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
       label.setAttribute('x', x + width / 2);
       label.setAttribute('y', y + height - 2);
       label.setAttribute('class', 'map-label');
-      label.textContent = userLevel > 0 ? String(userLevel) : (extra > 0 ? '0' : '');
-      if (userLevel > 0 || extra > 0) overlay.append(label);
-      
-      if (extra > 0) {
+      if (userLevelOverLimit) label.classList.add('over-limit');
+      if (isLocked) {
+        label.textContent = '🔒';
+      } else if (!mod || mod.levels.length === 0 || currentLevel === 0) {
+        label.textContent = '0';
+      } else {
+        label.textContent = (currentLevel >= maxLevel ? 'MAX' : String(currentLevel));
+      }
+      group.append(label);
+
+      // Future level indicator
+      if (extra > 0 && later && !limitedByMaxMp) {
         const futureLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
         futureLabel.setAttribute('x', x + width / 2);
         futureLabel.setAttribute('y', y + height - 15);
         futureLabel.setAttribute('class', 'map-label future');
-        futureLabel.textContent = `+${extra - userLevel}`;
-        overlay.append(futureLabel);
+        futureLabel.textContent = `+${extra}`;
+        group.append(futureLabel);
       }
+
+      if (limitedByMaxMp) {
+        const limitLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        limitLabel.setAttribute('x', x + width / 2);
+        limitLabel.setAttribute('y', y + height - 15);
+        limitLabel.setAttribute('class', 'map-label mp-limit-indicator');
+        limitLabel.textContent = '⬆️ MP';
+        group.append(limitLabel);
+      }
+
+      // Event handlers
+      group.addEventListener('click', (e) => {
+        e.preventDefault();
+        changeModLevel(badge.label, 1);
+      });
+      group.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        changeModLevel(badge.label, -1);
+      });
+      group.addEventListener('mouseenter', () => {
+        tooltipTimeout = setTimeout(() => showTooltip(badge, group), 1000);
+      });
+      group.addEventListener('mouseleave', () => {
+        clearTimeout(tooltipTimeout);
+        hideTooltip();
+      });
+
+      overlay.append(group);
     }
-    status.textContent = `${matched} mapped mods | current ${currentMp.value || '0'} MP | future ${futureMp.value || '0'} MP`;
+
+    status.textContent = `${matched} mapped mods | current ${currentMpInput.value || '0'} MP | future ${futureMpInput.value || '0'} MP`;
   }
 
-  function incrementMod(code) {
-    modLevelOverrides[code] = (modLevelOverrides[code] || 0) + 1;
-    render();
+  async function loadDefault(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`${url}: ${response.status}`);
+    return response.text();
   }
 
-  function decrementMod(code) {
-    if ((modLevelOverrides[code] || 0) > 0) {
-      modLevelOverrides[code]--;
-      if (modLevelOverrides[code] === 0) delete modLevelOverrides[code];
+  async function loadInitialData() {
+    try {
+      const rows = parseCsv(await loadDefault('./mod_tree_data.csv'));
+      mods = buildMods(rows);
+      badges = buildBadges(rows);
+      
+      restoreUrlState();
+      render();
+    } catch (error) {
+      status.textContent = 'Unable to load data; open this page through a local web server';
     }
-    render();
   }
 
   function buildMods(rows) {
@@ -315,7 +646,8 @@
       if (!row.Code) continue;
       if (!byCode.has(row.Code)) byCode.set(row.Code, {
         Code: row.Code, mod_name: row.mod_name || row.Code,
-        mod_type: row.mod_type || 'Unknown', levels: []
+        mod_type: row.mod_type || 'Unknown', levels: [],
+        unlockedBy: row['Unlocked By'] || null
       });
       const cost = parseMagnitude(row.cost);
       byCode.get(row.Code).levels.push({ level: Number(row.mod_level) || 0, cost });
@@ -340,88 +672,65 @@
     return [...byLabel.values()];
   }
 
-  async function loadCsv(url) {
-    const response = await fetch(url);
-    if (!response.ok) throw new Error(`Failed to load ${url}`);
-    return response.text();
-  }
-
-  async function loadInitialData() {
-    try {
-      const rows = parseCsv(await loadCsv('./mod_tree_data.csv'));
-      mods = buildMods(rows);
-      badges = buildBadges(rows);
-      loadStateFromUrl();
-      render();
-    } catch (error) {
-      status.textContent = 'Error loading data: ' + error.message;
-    }
-  }
-
-  function encodeState() {
-    const state = {
-      currentMp: currentMp.value,
-      futureMp: futureMp.value,
-      mods: modLevelOverrides
-    };
-    return btoa(JSON.stringify(state));
-  }
-
-  function decodeState(encoded) {
-    try {
-      return JSON.parse(atob(encoded));
-    } catch {
-      return null;
-    }
-  }
-
-  function loadStateFromUrl() {
-    const params = new URLSearchParams(window.location.search);
-    const state = params.get('s');
-    if (state) {
-      const decoded = decodeState(state);
-      if (decoded) {
-        currentMp.value = decoded.currentMp || '0';
-        futureMp.value = decoded.futureMp || '0';
-        modLevelOverrides = decoded.mods || {};
+  function applyCurrentMpToLevels() {
+    const now = parseMagnitude(currentMpInput.value);
+    if (!now) return;
+    
+    // Update auto levels first
+    updateAutoLevels();
+    
+    // For any user-set level that's below what current MP can afford, raise it
+    for (const [code, userLevel] of userLevels) {
+      const autoLevel = autoLevels.get(code) || 0;
+      if (autoLevel > userLevel) {
+        userLevels.set(code, autoLevel);
       }
     }
+    
+    setUrlParams();
+    render();
   }
 
-  function updateUrl() {
-    const encoded = encodeState();
-    window.history.replaceState(null, '', `?s=${encoded}`);
-  }
+  document.getElementById('updateButton').addEventListener('click', () => {
+    applyCurrentMpToLevels();
+  });
+  
+  document.getElementById('resetButton').addEventListener('click', () => {
+    currentMpInput.value = '0';
+    futureMpInput.value = '0';
+    limitMaxMpCheckbox.checked = false;
+    userLevels.clear();
+    setUrlParams();
+    render();
+  });
 
-  function shareLink() {
-    updateUrl();
-    const url = window.location.href;
-    navigator.clipboard.writeText(url).then(() => {
-      const oldText = document.getElementById('shareButton').textContent;
-      document.getElementById('shareButton').textContent = '✓ Copied!';
-      setTimeout(() => {
-        document.getElementById('shareButton').textContent = oldText;
-      }, 2000);
+  limitMaxMpCheckbox.addEventListener('change', render);
+
+  for (const input of [currentMpInput, futureMpInput]) {
+    input.addEventListener('change', () => {
+      if (input === currentMpInput) {
+        applyCurrentMpToLevels();
+      } else {
+        setUrlParams();
+        render();
+      }
+    });
+    input.addEventListener('keydown', event => {
+      if (event.key === 'Enter') {
+        if (event.target === currentMpInput) {
+          applyCurrentMpToLevels();
+        } else {
+          setUrlParams();
+          render();
+        }
+      }
     });
   }
 
-  function resetAll() {
-    currentMp.value = '0';
-    futureMp.value = '0';
-    modLevelOverrides = {};
-    render();
-    updateUrl();
-  }
-
-  currentMp.addEventListener('change', () => { render(); updateUrl(); });
-  currentMp.addEventListener('keydown', event => { if (event.key === 'Enter') { render(); updateUrl(); } });
-  futureMp.addEventListener('change', () => { render(); updateUrl(); });
-  futureMp.addEventListener('keydown', event => { if (event.key === 'Enter') { render(); updateUrl(); } });
-  document.getElementById('shareButton').addEventListener('click', shareLink);
-  document.getElementById('resetButton').addEventListener('click', resetAll);
   image.addEventListener('load', render);
   image.addEventListener('error', () => { status.textContent = 'Unable to load map image'; });
-  
+  overlay.addEventListener('mouseleave', hideTooltip);
+
   loadInitialData();
 })();
 </script>
