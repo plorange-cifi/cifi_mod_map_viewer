@@ -250,7 +250,7 @@
       const color = mod ? colorFor(mod.mod_type) : palette.Unknown;
       
       // Show highlight if user level exists and is less than current+future affordable
-      const shouldHighlight = userLevel > 0 && userLevel < (currentLevel + extra);
+      const shouldHighlight = userLevel > 0 && userLevel <= futureLevel;
       
       if (shouldHighlight || extra > 0) {
         const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
