@@ -1,0 +1,429 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loop Mod Map Planner</title>
+<style>
+  :root {
+    color-scheme: dark;
+    --bg: #120d0d;
+    --panel: #211414;
+    --line: #56342d;
+    --text: #f1e9dc;
+    --muted: #b7a69a;
+    --accent: #f0c95c;
+    --field: #100b0b;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    min-width: 320px;
+    min-height: 100vh;
+    background: var(--bg);
+    color: var(--text);
+    font-family: "Bahnschrift", "Segoe UI", sans-serif;
+  }
+  header {
+    position: sticky;
+    top: 0;
+    z-index: 5;
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+    padding: 12px 18px;
+    background: rgba(33, 20, 20, 0.97);
+    border-bottom: 1px solid var(--line);
+    box-shadow: 0 5px 20px #0008;
+  }
+  h1 {
+    margin: 0 10px 0 0;
+    color: var(--accent);
+    font-family: Georgia, "Times New Roman", serif;
+    font-size: 20px;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .control {
+    display: flex;
+    align-items: center;
+    gap: 7px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  .control input[type="text"] {
+    width: 105px;
+    padding: 7px 8px;
+    border: 1px solid #68443a;
+    border-radius: 3px;
+    background: var(--field);
+    color: var(--text);
+    font: 13px Consolas, monospace;
+  }
+  input:focus-visible, button:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+  }
+  button {
+    padding: 7px 11px;
+    border: 1px solid #8c6446;
+    border-radius: 3px;
+    background: #38251d;
+    color: var(--text);
+    cursor: pointer;
+  }
+  button:hover { background: #503326; }
+  #status {
+    margin-left: auto;
+    color: var(--muted);
+    font-size: 12px;
+  }
+  main { padding: 12px; }
+  .map-scroll {
+    width: 100%;
+    height: calc(100vh - 94px);
+    min-height: 360px;
+    overflow: auto;
+    border: 1px solid var(--line);
+    background: #0a0707;
+  }
+  #mapCanvas {
+    position: relative;
+    width: 1161px;
+    max-width: none;
+    margin: 0 auto;
+    line-height: 0;
+  }
+  #mapImage { display: block; width: 100%; height: auto; }
+  #overlay { position: absolute; inset: 0; width: 100%; height: 100%; overflow: visible; }
+  .future-box { stroke-width: 2; vector-effect: non-scaling-stroke; cursor: pointer; }
+  .future-box:hover { opacity: 0.8; }
+  .map-label {
+    fill: #fff7ce;
+    stroke: #160d0b;
+    stroke-width: 3px;
+    paint-order: stroke;
+    font: 700 13px Consolas, monospace;
+    text-anchor: middle;
+    dominant-baseline: auto;
+    pointer-events: none;
+  }
+  .map-label.future { fill: #fff; font-size: 12px; }
+  @media (max-width: 760px) {
+    header { gap: 10px 14px; padding: 10px 12px; }
+    h1 { width: 100%; font-size: 18px; }
+    #status { margin-left: 0; width: 100%; }
+    main { padding: 7px; }
+    .map-scroll { height: calc(100vh - 165px); }
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>Loop Mod Map</h1>
+  <label class="control">Current MP <input id="currentMp" type="text" value="0" aria-label="Current MP"></label>
+  <label class="control">Max future MP <input id="futureMp" type="text" value="0" aria-label="Maximum future MP"></label>
+  <button id="shareButton" type="button" title="Copy share link">🔗 Share</button>
+  <button id="resetButton" type="button">Reset</button>
+  <span id="status" role="status">Loading map data...</span>
+</header>
+<main>
+  <div class="map-scroll" id="mapScroll">
+    <div id="mapCanvas">
+      <img id="mapImage" src="./loop_mod_map.png" alt="Loop modification map">
+      <svg id="overlay" aria-label="Expected mod levels"></svg>
+    </div>
+  </div>
+</main>
+<script>
+(() => {
+  const palette = {
+    MP: '#e63946', Cells: '#39ff14', Shards: '#00d9ff', Research: '#f4a261',
+    AP: '#173f8a', Materials: '#6a994e', 'Tickspeed Mult': '#577590',
+    LP: '#b028d6', RP: '#f77ff7', Diamonds: '#e6b422',
+    'Loop Reset Reduction': '#8d5a97', Unknown: '#777777'
+  };
+  const suffixExponents = { k: 3, m: 6, b: 9, t: 12, qa: 15, qu: 18, sx: 21, sp: 24, o: 27, n: 30, d: 33 };
+  const status = document.getElementById('status');
+  const image = document.getElementById('mapImage');
+  const overlay = document.getElementById('overlay');
+  const currentMp = document.getElementById('currentMp');
+  const futureMp = document.getElementById('futureMp');
+  let mods = [];
+  let badges = [];
+  let modLevelOverrides = {}; // Track user-made level changes
+
+  function parseCsv(text) {
+    const rows = [];
+    let row = [], field = '', quoted = false;
+    for (let i = 0; i < text.length; i++) {
+      const char = text[i];
+      if (quoted) {
+        if (char === '"' && text[i + 1] === '"') { field += '"'; i++; }
+        else if (char === '"') quoted = false;
+        else field += char;
+      } else if (char === '"') quoted = true;
+      else if (char === ',') { row.push(field); field = ''; }
+      else if (char === '\n') { row.push(field.replace(/\r$/, '')); rows.push(row); row = []; field = ''; }
+      else field += char;
+    }
+    if (field.length || row.length) { row.push(field.replace(/\r$/, '')); rows.push(row); }
+    if (!rows.length) return [];
+    const headers = rows.shift().map(value => value.trim());
+    return rows.filter(values => values.some(value => value.trim())).map(values =>
+      Object.fromEntries(headers.map((header, index) => [header, (values[index] ?? '').trim()]))
+    );
+  }
+
+  function parseMagnitude(value) {
+    const text = String(value ?? '').trim().toLowerCase().replace(/\s+/g, '');
+    const suffix = text.match(/^([0-9]*\.?[0-9]+)(k|m|b|t|qa|qu|sx|sp|o|n|d)$/);
+    if (suffix) {
+      const amount = Number(suffix[1]);
+      if (!(amount > 0) || !Number.isFinite(amount)) return null;
+      const shift = Math.floor(Math.log10(amount));
+      return { mantissa: amount / (10 ** shift), exponent: suffixExponents[suffix[2]] + shift };
+    }
+    const scientific = text.match(/^([+]?(?:\d+\.?\d*|\.\d+))e([+-]?\d+)$/);
+    if (scientific) {
+      const mantissa = Number(scientific[1]);
+      const shift = Math.floor(Math.log10(mantissa));
+      if (!(mantissa > 0) || !Number.isFinite(mantissa)) return null;
+      return { mantissa: mantissa / (10 ** shift), exponent: Number(scientific[2]) + shift };
+    }
+    const number = Number(text);
+    if (!(number > 0) || !Number.isFinite(number)) return null;
+    const exponent = Math.floor(Math.log10(number));
+    return { mantissa: number / (10 ** exponent), exponent };
+  }
+
+  function compare(a, b) {
+    if (a.exponent !== b.exponent) return a.exponent < b.exponent ? -1 : 1;
+    return a.mantissa === b.mantissa ? 0 : (a.mantissa < b.mantissa ? -1 : 1);
+  }
+
+  function add(a, b) {
+    const exponent = Math.max(a.exponent, b.exponent);
+    const mantissa = a.mantissa * (10 ** (a.exponent - exponent)) + b.mantissa * (10 ** (b.exponent - exponent));
+    const shift = Math.floor(Math.log10(mantissa));
+    return { mantissa: mantissa / (10 ** shift), exponent: exponent + shift };
+  }
+
+  function affordableLevelCount(mod, budget) {
+    if (!budget) return 0;
+    let spent = { mantissa: 0, exponent: 0 }, count = 0;
+    for (const level of mod.levels) {
+      if (!level.cost) continue;
+      const nextSpent = spent.mantissa === 0 ? level.cost : add(spent, level.cost);
+      if (compare(nextSpent, budget) > 0) break;
+      spent = nextSpent;
+      count++;
+    }
+    return count;
+  }
+
+  function colorFor(type) { return palette[type] || palette.Unknown; }
+
+  function getCurrentLevel(mod) {
+    return modLevelOverrides[mod.Code] !== undefined ? modLevelOverrides[mod.Code] : 0;
+  }
+
+  function render() {
+    if (!mods.length || !badges.length || !image.naturalWidth) return;
+    const now = parseMagnitude(currentMp.value);
+    const later = parseMagnitude(futureMp.value);
+    const modByCode = new Map(mods.map(mod => [mod.Code, mod]));
+    overlay.setAttribute('viewBox', `0 0 ${image.naturalWidth} ${image.naturalHeight}`);
+    overlay.replaceChildren();
+    let matched = 0;
+    for (const badge of badges) {
+      const mod = modByCode.get(badge.label);
+      if (mod) matched++;
+      const x = Number(badge.x), y = Number(badge.y);
+      const width = Number(badge.width), height = Number(badge.height);
+      if (![x, y, width, height].every(Number.isFinite)) continue;
+      const currentLevel = mod ? affordableLevelCount(mod, now) : 0;
+      const futureLevel = mod ? affordableLevelCount(mod, later) : 0;
+      const userLevel = mod ? getCurrentLevel(mod) : 0;
+      const extra = Math.max(0, futureLevel - currentLevel);
+      const color = mod ? colorFor(mod.mod_type) : palette.Unknown;
+      
+      // Show highlight if user level exists and is less than current+future affordable
+      const shouldHighlight = userLevel > 0 && userLevel < (currentLevel + extra);
+      
+      if (shouldHighlight || extra > 0) {
+        const rect = document.createElementNS('http://www.w3.org/2000/svg', 'rect');
+        rect.setAttribute('x', x); rect.setAttribute('y', y);
+        rect.setAttribute('width', width); rect.setAttribute('height', height);
+        rect.setAttribute('rx', 3);
+        rect.setAttribute('fill', color); rect.setAttribute('fill-opacity', shouldHighlight ? '0.5' : '0.35');
+        rect.setAttribute('stroke', color); rect.setAttribute('class', 'future-box');
+        rect.setAttribute('data-code', badge.label);
+        
+        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
+        title.textContent = mod ? `${mod.mod_name} (${mod.mod_type}): Level ${userLevel || 0}` : badge.label;
+        rect.append(title); 
+        
+        rect.addEventListener('click', (e) => {
+          e.preventDefault();
+          incrementMod(badge.label);
+        });
+        rect.addEventListener('contextmenu', (e) => {
+          e.preventDefault();
+          decrementMod(badge.label);
+        });
+        
+        overlay.append(rect);
+      }
+      
+      const label = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+      label.setAttribute('x', x + width / 2);
+      label.setAttribute('y', y + height - 2);
+      label.setAttribute('class', 'map-label');
+      label.textContent = userLevel > 0 ? String(userLevel) : (extra > 0 ? '0' : '');
+      if (userLevel > 0 || extra > 0) overlay.append(label);
+      
+      if (extra > 0) {
+        const futureLabel = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+        futureLabel.setAttribute('x', x + width / 2);
+        futureLabel.setAttribute('y', y + height - 15);
+        futureLabel.setAttribute('class', 'map-label future');
+        futureLabel.textContent = `+${extra - userLevel}`;
+        overlay.append(futureLabel);
+      }
+    }
+    status.textContent = `${matched} mapped mods | current ${currentMp.value || '0'} MP | future ${futureMp.value || '0'} MP`;
+  }
+
+  function incrementMod(code) {
+    modLevelOverrides[code] = (modLevelOverrides[code] || 0) + 1;
+    render();
+  }
+
+  function decrementMod(code) {
+    if ((modLevelOverrides[code] || 0) > 0) {
+      modLevelOverrides[code]--;
+      if (modLevelOverrides[code] === 0) delete modLevelOverrides[code];
+    }
+    render();
+  }
+
+  function buildMods(rows) {
+    const byCode = new Map();
+    for (const row of rows) {
+      if (!row.Code) continue;
+      if (!byCode.has(row.Code)) byCode.set(row.Code, {
+        Code: row.Code, mod_name: row.mod_name || row.Code,
+        mod_type: row.mod_type || 'Unknown', levels: []
+      });
+      const cost = parseMagnitude(row.cost);
+      byCode.get(row.Code).levels.push({ level: Number(row.mod_level) || 0, cost });
+    }
+    return [...byCode.values()].map(mod => ({
+      ...mod, levels: mod.levels.sort((a, b) => a.level - b.level)
+    }));
+  }
+
+  function buildBadges(rows) {
+    const byLabel = new Map();
+    for (const row of rows) {
+      if (!row.badge_label || byLabel.has(row.badge_label)) continue;
+      byLabel.set(row.badge_label, {
+        label: row.badge_label,
+        x: row.badge_x,
+        y: row.badge_y,
+        width: row.badge_width,
+        height: row.badge_height
+      });
+    }
+    return [...byLabel.values()];
+  }
+
+  async function loadCsv(url) {
+    const response = await fetch(url);
+    if (!response.ok) throw new Error(`Failed to load ${url}`);
+    return response.text();
+  }
+
+  async function loadInitialData() {
+    try {
+      const rows = parseCsv(await loadCsv('./mod_tree_data.csv'));
+      mods = buildMods(rows);
+      badges = buildBadges(rows);
+      loadStateFromUrl();
+      render();
+    } catch (error) {
+      status.textContent = 'Error loading data: ' + error.message;
+    }
+  }
+
+  function encodeState() {
+    const state = {
+      currentMp: currentMp.value,
+      futureMp: futureMp.value,
+      mods: modLevelOverrides
+    };
+    return btoa(JSON.stringify(state));
+  }
+
+  function decodeState(encoded) {
+    try {
+      return JSON.parse(atob(encoded));
+    } catch {
+      return null;
+    }
+  }
+
+  function loadStateFromUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const state = params.get('s');
+    if (state) {
+      const decoded = decodeState(state);
+      if (decoded) {
+        currentMp.value = decoded.currentMp || '0';
+        futureMp.value = decoded.futureMp || '0';
+        modLevelOverrides = decoded.mods || {};
+      }
+    }
+  }
+
+  function updateUrl() {
+    const encoded = encodeState();
+    window.history.replaceState(null, '', `?s=${encoded}`);
+  }
+
+  function shareLink() {
+    updateUrl();
+    const url = window.location.href;
+    navigator.clipboard.writeText(url).then(() => {
+      const oldText = document.getElementById('shareButton').textContent;
+      document.getElementById('shareButton').textContent = '✓ Copied!';
+      setTimeout(() => {
+        document.getElementById('shareButton').textContent = oldText;
+      }, 2000);
+    });
+  }
+
+  function resetAll() {
+    currentMp.value = '0';
+    futureMp.value = '0';
+    modLevelOverrides = {};
+    render();
+    updateUrl();
+  }
+
+  currentMp.addEventListener('change', () => { render(); updateUrl(); });
+  currentMp.addEventListener('keydown', event => { if (event.key === 'Enter') { render(); updateUrl(); } });
+  futureMp.addEventListener('change', () => { render(); updateUrl(); });
+  futureMp.addEventListener('keydown', event => { if (event.key === 'Enter') { render(); updateUrl(); } });
+  document.getElementById('shareButton').addEventListener('click', shareLink);
+  document.getElementById('resetButton').addEventListener('click', resetAll);
+  image.addEventListener('load', render);
+  image.addEventListener('error', () => { status.textContent = 'Unable to load map image'; });
+  
+  loadInitialData();
+})();
+</script>
+</body>
+</html>
