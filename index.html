@@ -461,6 +461,10 @@
 
     const currentLevel = getDisplayLevel(badge.label);
     const maxLevel = mod.levels.length;
+    const expectedBudget = parseMagnitude(futureMpInput.value);
+    const expectedLevel = expectedBudget
+      ? calculateFutureLevel(badge.label, expectedBudget, new Map())
+      : null;
     const isLocked = !canUnlock(badge.label);
     const exceedsMaxMp = limitMaxMpCheckbox.checked && currentLevel > maxLevelForMod(mod);
 
@@ -479,6 +483,10 @@
       if (currentLevel < maxLevel && mod.levels[currentLevel]?.cost) {
         html += `<div class="tooltip-line">Cost to next: ${formatMagnitude(mod.levels[currentLevel].cost)}</div>`;
       }
+    }
+    if (expectedLevel !== null) {
+      const expectedLevelText = expectedLevel >= maxLevel ? 'MAX' : `${expectedLevel}/${maxLevel}`;
+      html += `<div class="tooltip-line">Expected level at max future MP: ${expectedLevelText}</div>`;
     }
     tooltip.innerHTML = html;
     tooltip.classList.add('visible');
@@ -559,9 +567,6 @@
         rect.setAttribute('rx', 3);
         rect.setAttribute('fill', color); rect.setAttribute('fill-opacity', '0.35');
         rect.setAttribute('stroke', color); rect.setAttribute('class', 'future-box');
-        const title = document.createElementNS('http://www.w3.org/2000/svg', 'title');
-        title.textContent = `${mod.mod_name} (${mod.mod_type}): ${currentLevel} now, +${extra} by max future MP`;
-        rect.append(title);
         group.append(rect);
       }
 
