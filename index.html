@@ -495,7 +495,8 @@
     if (exponent < 3) return String(mag.mantissa * (10 ** exponent));
     const suffixes = ['', 'k', 'm', 'b', 't', 'qa', 'qu', 'sx', 'sp', 'o', 'n', 'd'];
     const suffixIndex = Math.floor(exponent / 3);
-    const suffix = suffixes[suffixIndex] || `e${exponent}`;
+    const suffix = suffixes[suffixIndex];
+    if (!suffix) return mag.mantissa.toFixed(2).replace(/\.?0+$/, '') + `e${exponent}`;
     const adjustedExp = exponent % 3;
     const value = mag.mantissa * (10 ** adjustedExp);
     return value.toFixed(2).replace(/\.?0+$/, '') + suffix;
