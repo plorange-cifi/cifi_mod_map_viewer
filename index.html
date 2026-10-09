@@ -206,15 +206,19 @@
       const slots = [];
       let hasUserLevel = false;
       for (const code of groupCodes) {
-        const level = userLevels.get(code) || 0;
+        const hasOverride = userLevels.has(code);
+        const level = hasOverride ? userLevels.get(code) : 0;
         const maxLevel = modsByCode.get(code).levels.length;
         const width = maxLevel > 35 ? 2 : 1;
         if (!Number.isInteger(level) || level < 0 || level > maxLevel || level >= 36 ** width) return null;
-        if (level > 0) hasUserLevel = true;
-        slots.push({ level, encoded: level.toString(36).toUpperCase().padStart(width, '0') });
+        if (hasOverride) hasUserLevel = true;
+        const encoded = hasOverride && level === 0
+          ? '!'.repeat(width)
+          : level.toString(36).toUpperCase().padStart(width, '0');
+        slots.push({ level, hasOverride, encoded });
       }
       if (hasUserLevel) {
-        while (slots.length && slots[slots.length - 1].level === 0) slots.pop();
+        while (slots.length && slots[slots.length - 1].level === 0 && !slots[slots.length - 1].hasOverride) slots.pop();
         blocks.push(letter + slots.map(slot => slot.encoded).join(''));
       }
     }
@@ -246,10 +250,14 @@
         const width = modsByCode.get(code).levels.length > 35 ? 2 : 1;
         if (offset === block.length) break;
         const valueText = block.slice(offset, offset + width);
-        if (valueText.length !== width || !/^[0-9A-Z]+$/.test(valueText)) return {};
-        const level = Number.parseInt(valueText, 36);
-        if (!Number.isInteger(level) || level > modsByCode.get(code).levels.length) return {};
-        if (level > 0) userLevels[code] = level;
+        if (valueText.length !== width || !/^(?:[0-9A-Z]+|!+)$/.test(valueText)) return {};
+        if (/^!+$/.test(valueText)) {
+          userLevels[code] = 0;
+        } else {
+          const level = Number.parseInt(valueText, 36);
+          if (!Number.isInteger(level) || level > modsByCode.get(code).levels.length) return {};
+          if (level > 0) userLevels[code] = level;
+        }
         offset += width;
       }
       if (offset !== block.length) return {};
@@ -437,9 +445,10 @@
 
     let newLevel = currentLevel + delta;
     newLevel = Math.max(0, Math.min(newLevel, maxLevel));
+    if (newLevel === currentLevel) return;
 
     if (newLevel === 0) {
-      userLevels.delete(modCode);
+      userLevels.set(modCode, 0);
     } else {
       // Check unlock requirement
       if (!canUnlock(modCode)) return;
@@ -687,6 +696,7 @@
     
     // For any user-set level that's below what current MP can afford, raise it
     for (const [code, userLevel] of userLevels) {
+      if (userLevel === 0) continue;
       const autoLevel = autoLevels.get(code) || 0;
       if (autoLevel > userLevel) {
         userLevels.set(code, autoLevel);
